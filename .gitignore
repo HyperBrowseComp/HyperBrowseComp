@@ -1,0 +1,39 @@
+# OS and editor metadata
+.DS_Store
+.idea/
+.vscode/
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+
+# Local runtime state
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+logs/
+data/*
+!data/dev.jsonl
+!data/owl_multimodal_smoke.jsonl
+!data/owl_video_smoke.jsonl
+!data/owl_bilibili_smoke.jsonl
+!data/owl_media_smoke.jsonl
+.inspect_home/
+
+tmp/
+artifacts/
+dump/
+external/

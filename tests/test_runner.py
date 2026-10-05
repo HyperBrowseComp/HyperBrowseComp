@@ -1,0 +1,452 @@
+from datetime import datetime, timezone
+from pathlib import Path
+import json
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from hyper_browsecomp.config import RunConfig
+from hyper_browsecomp.runner import (
+    build_inspect_command,
+    configured_sample_ids,
+    finalize_unfinished_owl_traces,
+    _hide_confidential_score_explanations,
+    main,
+    prepare_env,
+    rename_new_eval_log,
+    _redact_value,
+    unfinished_sample_ids,
+)
+
+
+def test_prepare_env_maps_generic_model_env(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    config = RunConfig(
+        provider="openai",
+        model_name="gpt-5-mini",
+        model_api_key_env="OPENAI_API_KEY",
+        model_base_url="https://example.com/v1",
+    )
+    env = prepare_env(config)
+    assert env["OPENAI_API_KEY"] == "secret"
+    assert env["OPENAI_BASE_URL"] == "https://example.com/v1"
+    assert env["HOME"].endswith(".inspect_home")
+
+
+def test_prepare_env_maps_minimax_key_and_endpoint(monkeypatch) -> None:
+    monkeypatch.setenv("CUSTOM_MINIMAX_TEST_KEY", "offline-minimax-key")
+    config = RunConfig(
+        provider="minimax",
+        model_name="MiniMax-M3",
+        model_api_key_env="CUSTOM_MINIMAX_TEST_KEY",
+        model_base_url="https://api.minimax.io/anthropic",
+    )
+    env = prepare_env(config)
+    assert env["MINIMAX_API_KEY"] == "offline-minimax-key"
+    assert env["MINIMAX_BASE_URL"] == "https://api.minimax.io/anthropic"
+
+
+def test_prepare_env_maps_scorer_from_configured_env(monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "scorer-secret")
+    config = RunConfig(
+        provider="openai",
+        model_name="gpt-5-mini",
+        scorer_provider="openrouter",
+        scorer_model_name="openai/gpt-5.4-mini",
+        scorer_api_key_env="OPENROUTER_API_KEY",
+        scorer_base_url="https://openrouter.ai/api/v1",
+    )
+    env = prepare_env(config)
+    assert env["OPENROUTER_API_KEY"] == "scorer-secret"
+    assert env["OPENROUTER_BASE_URL"] == "https://openrouter.ai/api/v1"
+
+
+def test_prepare_env_maps_gemini_to_google_env(monkeypatch) -> None:
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-secret")
+    config = RunConfig(
+        provider="gemini",
+        model_name="gemini-2.5-pro",
+        model_api_key_env="GOOGLE_API_KEY",
+        model_base_url="https://generativelanguage.googleapis.com",
+    )
+    env = prepare_env(config)
+    assert env["GOOGLE_API_KEY"] == "google-secret"
+    assert env["GOOGLE_BASE_URL"] == "https://generativelanguage.googleapis.com"
+
+
+def test_prepare_env_maps_grok_to_xai_env(monkeypatch) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "xai-secret")
+    config = RunConfig(
+        provider="grok",
+        model_name="grok-3-mini",
+        model_api_key_env="XAI_API_KEY",
+        model_base_url="api.x.ai",
+    )
+    env = prepare_env(config)
+    assert env["XAI_API_KEY"] == "xai-secret"
+    assert env["XAI_BASE_URL"] == "api.x.ai"
+
+
+def test_build_inspect_command_adds_strict_tools_false() -> None:
+    config = RunConfig(provider="deepseek", model_name="deepseek-chat")
+    command = build_inspect_command(config)
+    assert "-M" in command
+    assert "strict_tools=false" in command
+    assert "--max-retries" in command
+    assert "--attempt-timeout" in command
+    assert "--retry-on-error" in command
+    assert "3" in command
+    assert "--no-fail-on-error" in command
+    assert "--continue-on-fail" in command
+
+
+def test_build_inspect_command_passes_model_args_as_json() -> None:
+    config = RunConfig(
+        provider="openrouter",
+        model_name="anthropic/claude-fable-5.1",
+        model_args={"provider": {"only": ["google-vertex"]}},
+    )
+    command = build_inspect_command(config)
+    assert "openrouter/anthropic/claude-fable-5.1" in command
+    assert 'provider={"only":["google-vertex"]}' in command
+
+
+def test_build_inspect_command_passes_sample_range() -> None:
+    config = RunConfig(provider="deepseek", model_name="deepseek-chat", sample_range="1-2")
+    command = build_inspect_command(config)
+    assert "-T" in command
+    assert "sample_range=1-2" in command
+
+
+def test_build_inspect_command_passes_minimax_selection_and_resume_options() -> None:
+    config = RunConfig(
+        provider="minimax",
+        model_name="MiniMax-M3",
+        model_args={"thinking": True},
+        sample_ids_file="configs/internal_full/retained_ids.txt",
+        search_backend="internal",
+        fetch_backend="none",
+        inspect_max_samples_parallel=5,
+        inspect_checkpoint="turn:1",
+        inspect_log_buffer=1,
+        auto_resume=True,
+    )
+    command = build_inspect_command(config)
+    assert command[command.index("--model") + 1] == "minimax/MiniMax-M3"
+    assert "thinking=true" in command
+    assert "strict_tools=false" not in command
+    assert "sample_ids_file=configs/internal_full/retained_ids.txt" in command
+    assert "search_backend=internal" in command
+    assert "fetch_backend=none" in command
+    assert "model_provider=minimax" in command
+    assert command[command.index("--max-samples") + 1] == "5"
+    assert command[command.index("--checkpoint") + 1] == "turn:1"
+    assert command[command.index("--log-buffer") + 1] == "1"
+
+
+def test_build_inspect_command_omits_checkpoint_options_by_default() -> None:
+    command = build_inspect_command(RunConfig(provider="minimax", model_name="MiniMax-M3"))
+    assert "--checkpoint" not in command
+    assert "--log-buffer" not in command
+
+
+def test_build_inspect_command_can_limit_sample_ids() -> None:
+    config = RunConfig(provider="deepseek", model_name="deepseek-chat")
+    command = build_inspect_command(config, sample_ids=["q2", "q3"])
+    assert "--sample-id" in command
+    assert "q2,q3" in command
+
+
+def test_build_inspect_command_reads_sample_ids_path(tmp_path: Path) -> None:
+    ids_path = tmp_path / "retained.txt"
+    ids_path.write_text("q3\n\n# excluded\nq1\n", encoding="utf-8")
+    config = RunConfig(
+        provider="deepseek",
+        model_name="deepseek-chat",
+        sample_ids_path=str(ids_path),
+    )
+
+    command = build_inspect_command(config)
+
+    assert configured_sample_ids(config) == ["q3", "q1"]
+    assert command[command.index("--sample-id") + 1] == "q3,q1"
+
+
+def test_configured_sample_ids_rejects_duplicates(tmp_path: Path) -> None:
+    ids_path = tmp_path / "retained.txt"
+    ids_path.write_text("q1\nq1\n", encoding="utf-8")
+    config = RunConfig(
+        provider="deepseek",
+        model_name="deepseek-chat",
+        sample_ids_path=str(ids_path),
+    )
+
+    with pytest.raises(ValueError, match="duplicate IDs"):
+        configured_sample_ids(config)
+
+
+def test_build_inspect_command_uses_native_provider_and_backend_args() -> None:
+    config = RunConfig(
+        provider="gemini",
+        model_name="gemini-2.5-pro",
+        search_backend="internal",
+        fetch_backend="none",
+    )
+    command = build_inspect_command(config)
+    assert "google/gemini-2.5-pro" in command
+    assert "search_backend=internal" in command
+    assert "fetch_backend=none" in command
+    assert "model_provider=gemini" in command
+
+
+def test_build_inspect_command_selects_isolated_multimodal_owl_harness() -> None:
+    config = RunConfig(
+        provider="openrouter",
+        model_name="google/gemini-3.7-flash",
+        model_api_key_env="OPENROUTER_API_KEY",
+        model_base_url="https://openrouter.ai/api/v1",
+        harness="owl",
+        search_backend="none",
+        fetch_backend="none",
+        owl_reasoning_effort="low",
+    )
+    command = build_inspect_command(config)
+    assert "harness=owl" in command
+    assert "owl_model_name=google/gemini-3.7-flash" in command
+    assert "owl_api_key_env=OPENROUTER_API_KEY" in command
+    assert "owl_base_url=https://openrouter.ai/api/v1" in command
+    assert "owl_headless=true" in command
+    assert "owl_multimodal=true" in command
+    assert "owl_browser_round_limit=12" in command
+    assert "owl_task_timeout_seconds=900" in command
+    assert "owl_timeout_scale=1.0" in command
+    assert "owl_finalize_reserve_seconds=120" in command
+    assert "owl_max_external_tool_calls=50" in command
+    assert "owl_max_model_calls=180" in command
+    assert "owl_model_max_retries=1" in command
+    assert "owl_reasoning_effort=low" in command
+    assert "owl_trace_dir=logs/owl/traces" in command
+    assert "max_steps=12" not in command
+    assert not any(arg.startswith("search_backend=") for arg in command)
+    assert not any(arg.startswith("fetch_backend=") for arg in command)
+
+
+def test_build_inspect_command_can_disable_control_server() -> None:
+    config = RunConfig(
+        provider="deepseek",
+        model_name="deepseek-chat",
+        inspect_ctl_server=False,
+    )
+    command = build_inspect_command(config)
+    assert command[command.index("--ctl-server") + 1] == "false"
+
+
+def test_finalize_unfinished_owl_traces_marks_new_running_sidecars(
+    tmp_path: Path,
+) -> None:
+    existing = tmp_path / "existing.json"
+    existing.write_text('{"status": "running"}', encoding="utf-8")
+    new_running = tmp_path / "new.json"
+    new_running.write_text(
+        '{"status": "running", "sample_id": "q1", "console": "q1.log"}',
+        encoding="utf-8",
+    )
+    completed = tmp_path / "completed.json"
+    completed.write_text('{"status": "completed"}', encoding="utf-8")
+    config = RunConfig(
+        provider="openrouter",
+        model_name="google/gemini-3.7-flash",
+        model_base_url="https://openrouter.ai/api/v1",
+        harness="owl",
+        owl_trace_dir=str(tmp_path),
+    )
+
+    finalized = finalize_unfinished_owl_traces(
+        config,
+        before={existing.resolve()},
+    )
+
+    assert finalized == [new_running.resolve()]
+    payload = json.loads(new_running.read_text(encoding="utf-8"))
+    assert payload["status"] == "error"
+    assert payload["termination_reason"] == "evaluation_process_ended"
+    assert payload["statistics"] == {}
+    assert json.loads(existing.read_text())["status"] == "running"
+    assert json.loads(completed.read_text())["status"] == "completed"
+
+
+def test_main_without_config_returns_usage_error(capsys) -> None:
+    assert main([]) == 2
+    captured = capsys.readouterr()
+    assert "usage: hyper-browsecomp CONFIG.yaml" in captured.err
+
+
+def test_runner_module_invokes_inspect(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    inspect_bin = bin_dir / "inspect"
+    captured = tmp_path / "inspect_args.txt"
+    inspect_bin.write_text(
+        f"#!/usr/bin/env sh\nprintf '%s\\n' \"$@\" > {captured}\n",
+        encoding="utf-8",
+    )
+    inspect_bin.chmod(0o755)
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "provider: deepseek",
+                "model_name: deepseek-chat",
+                "data_path: data/browsecomp_multilingual_indonesian_new.jsonl",
+                'sample_range: "1-2"',
+                f"log_dir: {tmp_path / 'logs'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "src"
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "hyper_browsecomp.runner", str(config_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert captured.exists()
+    args = captured.read_text(encoding="utf-8")
+    assert "eval\n" in args
+    assert "sample_range=1-2\n" in args
+    assert "--no-fail-on-error\n" in args
+    assert "--continue-on-fail\n" in args
+
+
+def test_rename_new_eval_log_uses_requested_pattern(tmp_path: Path, monkeypatch) -> None:
+    config = RunConfig(
+        provider="deepseek",
+        model_name="deepseek-chat",
+        data_path="data/my_dataset.jsonl",
+        log_dir=str(tmp_path),
+    )
+    original = tmp_path / "20260717T100000Z_hyper_browsecomp_abc.eval"
+    original.write_text("placeholder", encoding="utf-8")
+    before: set[Path] = set()
+
+    fake_log = SimpleNamespace(
+        eval=SimpleNamespace(created="2026-07-17T10:00:00Z", task_id="abc123")
+    )
+    monkeypatch.setattr("hyper_browsecomp.runner.read_eval_log", lambda path: fake_log)
+
+    renamed = rename_new_eval_log(
+        config,
+        before=before,
+        started_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+
+    assert renamed is not None
+    assert renamed.name == "my_dataset_deepseek-chat_20260717T100000Z_abc123.eval"
+    assert renamed.exists()
+
+
+def test_redact_value_recursively_replaces_secret_text() -> None:
+    value = {
+        "input": "Question?",
+        "events": [{"prompt": "Solve: Question?"}],
+        "target": ["Answer"],
+    }
+
+    _redact_value(
+        value,
+        [
+            ("Question?", "[REDACTED_Q]"),
+            ("Answer", "[REDACTED_A]"),
+        ],
+        set(),
+    )
+
+    assert value == {
+        "input": "[REDACTED_Q]",
+        "events": [{"prompt": "Solve: [REDACTED_Q]"}],
+        "target": ["[REDACTED_A]"],
+    }
+
+
+def test_redact_value_only_replaces_answers_in_grader_line() -> None:
+    value = {
+        "prompt": "[correct_answer]: 0",
+        "stats": "total 100 tokens, score 0.000",
+    }
+
+    _redact_value(value, [], set(), [("0", "[REDACTED_A]")])
+
+    assert value == {
+        "prompt": "[correct_answer]: [REDACTED_A]",
+        "stats": "total 100 tokens, score 0.000",
+    }
+
+
+def test_hide_confidential_score_explanations() -> None:
+    log = SimpleNamespace(
+        samples=[
+            SimpleNamespace(
+                metadata={"confidential": True},
+                scores={"browse_comp_scorer": SimpleNamespace(explanation="correct answer is 75")},
+                events=[SimpleNamespace(score=SimpleNamespace(explanation="correct answer is 75"))],
+            ),
+            SimpleNamespace(
+                metadata={},
+                scores={"browse_comp_scorer": SimpleNamespace(explanation="ordinary")},
+                events=[],
+            ),
+        ]
+    )
+
+    _hide_confidential_score_explanations(log)
+
+    assert (
+        log.samples[0].scores["browse_comp_scorer"].explanation
+        == "Grader reasoning hidden for confidential sample."
+    )
+    assert log.samples[0].events[0].score.explanation == (
+        "Grader reasoning hidden for confidential sample."
+    )
+    assert log.samples[1].scores["browse_comp_scorer"].explanation == "ordinary"
+
+
+def test_unfinished_sample_ids_returns_missing_and_error_samples(
+    tmp_path: Path, monkeypatch
+) -> None:
+    data_path = tmp_path / "data.jsonl"
+    data_path.write_text(
+        "\n".join(
+            [
+                '{"id":"q1","question":"one","answers":["a"]}',
+                '{"id":"q2","question":"two","answers":["b"]}',
+                '{"id":"q3","question":"three","answers":["c"]}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config = RunConfig(provider="deepseek", model_name="deepseek-chat", data_path=str(data_path))
+    fake_log = SimpleNamespace(
+        eval=SimpleNamespace(task_args={"data_path": str(data_path), "sample_range": "1-3"}),
+        samples=[
+            SimpleNamespace(id="q1", metadata={}, completed_at="2026-07-17T10:00:00Z", error=None),
+            SimpleNamespace(
+                id=2, metadata={"id": "q2"}, completed_at=None, error=SimpleNamespace()
+            ),
+            SimpleNamespace(id="outside", metadata={}, completed_at=None, error=SimpleNamespace()),
+        ],
+    )
+    monkeypatch.setattr("hyper_browsecomp.runner.read_eval_log", lambda *args, **kwargs: fake_log)
+
+    assert unfinished_sample_ids(config, "logs/partial.eval") == ["q2", "q3"]

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hyper-browsecomp"
+version = "0.1.0"
+description = "Evaluation harness for the HyperBrowseComp benchmark."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.115.0,<1",
+    "cryptography>=42.0",
+    "datasets>=2.20",
+    "httpx>=0.27",
+    "inspect-ai>=0.3.248",
+    "openai>=2.36.0",
+    "pydantic>=2.8",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+hyper-browsecomp = "hyper_browsecomp.runner:main"
+
+[project.urls]
+Repository = "https://github.com/faizr206/hyper-browsecomp"
+Issues = "https://github.com/faizr206/hyper-browsecomp/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
