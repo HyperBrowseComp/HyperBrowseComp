@@ -31,8 +31,8 @@ OWL runs also require Chromium. Local video processing requires FFmpeg on
 ## Setup
 
 ```bash
-git clone https://github.com/faizr206/hyper-browsecomp.git
-cd hyper-browsecomp
+git clone https://github.com/HyperBrowseComp/HyperBrowseComp.git
+cd HyperBrowseComp
 uv sync --extra dev
 cp .env.example .env
 uv run pytest -q
@@ -41,10 +41,13 @@ uv run pytest -q
 Fill in only the credentials needed by your chosen config. `.env` is ignored
 by Git; never commit credentials or decrypted benchmark data.
 
-For the encrypted full dataset, set its AES-256-GCM master key:
+For a full run, request access to the
+[423-question dataset](https://huggingface.co/datasets/afaji/HyperBrowseComp)
+and authenticate with Hugging Face. The full configs load its `test` split.
+Set the published AES-256-GCM decryption key in `.env`:
 
 ```dotenv
-HYPERBROWSECOMP_KEY=...
+HYPERBROWSECOMP_KEY=2a8633906fda29da5f696452a1e58f00fcb1edbb3b9c231783f3c1acf80021cb
 ```
 
 Development configs use the small fixtures in `data/` and do not require the
